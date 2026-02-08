@@ -1,320 +1,313 @@
 import React, { useState, useEffect, useRef } from 'react';
 
 export const MicTester: React.FC = () => {
-  const [status, setStatus] = useState<'IDLE' | 'REQUESTING' | 'ACTIVE' | 'RECORDING' | 'ERROR'>('IDLE');
-  const [errorMessage, setErrorMessage] = useState('');
-  const [audioBlobUrl, setAudioBlobUrl] = useState<string | null>(null);
-  const [deviceName, setDeviceName] = useState<string>('');
+  const [permissionGranted, setPermissionGranted] = useState(false);
+  const [devices, setDevices] = useState<MediaDeviceInfo[]>([]);
+  const [selectedDeviceId, setSelectedDeviceId] = useState<string>('');
+  const [volume, setVolume] = useState(0);
+  const [isListening, setIsListening] = useState(false); // Mode "Listen to this device"
+  const [error, setError] = useState<string>('');
 
-  // Refs for cleanup
-  const streamRef = useRef<MediaStream | null>(null);
+  // Refs
   const audioContextRef = useRef<AudioContext | null>(null);
-  const analyserRef = useRef<AnalyserNode | null>(null);
+  const streamRef = useRef<MediaStream | null>(null);
   const sourceRef = useRef<MediaStreamAudioSourceNode | null>(null);
+  const analyserRef = useRef<AnalyserNode | null>(null);
   const rafRef = useRef<number | null>(null);
-  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
-  const chunksRef = useRef<Blob[]>([]);
-  const canvasRef = useRef<HTMLCanvasElement>(null);
 
-  // Cleanup function to stop everything safely
-  const stopAll = () => {
-    // 1. Stop Recorder
-    if (mediaRecorderRef.current && mediaRecorderRef.current.state !== 'inactive') {
-      try { mediaRecorderRef.current.stop(); } catch (e) { console.warn(e); }
+  // Cleanup function
+  const stopResources = () => {
+    if (rafRef.current) cancelAnimationFrame(rafRef.current);
+    if (sourceRef.current) {
+        try { sourceRef.current.disconnect(); } catch (e) {}
+        sourceRef.current = null;
     }
-    
-    // 2. Stop Animation
-    if (rafRef.current) {
-      cancelAnimationFrame(rafRef.current);
-      rafRef.current = null;
-    }
-
-    // 3. Stop Tracks (Important for releasing the mic hardware)
     if (streamRef.current) {
       streamRef.current.getTracks().forEach(track => track.stop());
       streamRef.current = null;
     }
-
-    // 4. Close Audio Context
-    if (audioContextRef.current) {
-      audioContextRef.current.close().catch(console.warn);
-      audioContextRef.current = null;
-    }
-    
-    // Reset Refs
-    sourceRef.current = null;
-    analyserRef.current = null;
-    
-    setStatus('IDLE');
-    setDeviceName('');
   };
 
   useEffect(() => {
-    // Cleanup on unmount
-    return () => stopAll();
+    return () => {
+      stopResources();
+      audioContextRef.current?.close();
+    };
   }, []);
 
-  const initMic = async () => {
+  // 1. Get Permission & Enumerate Devices
+  const requestAccess = async () => {
     try {
-      setStatus('REQUESTING');
-      setErrorMessage('');
-      setAudioBlobUrl(null);
-      setDeviceName('');
-
-      // Check for browser support
-      if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
-        throw new Error("Trình duyệt của bạn không hỗ trợ truy cập Microphone (hoặc bạn đang không dùng HTTPS).");
-      }
-
-      // 1. Get Stream
-      const stream = await navigator.mediaDevices.getUserMedia({ 
-        audio: { 
-          echoCancellation: true, 
-          noiseSuppression: true,
-          autoGainControl: true 
-        } 
-      });
-      streamRef.current = stream;
+      setError('');
+      // Request initial access to get labels
+      // Note: We don't keep this stream because we want to request specific constraints later
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      stream.getTracks().forEach(t => t.stop());
       
-      // Extract Device Name from the stream track
-      const audioTrack = stream.getAudioTracks()[0];
-      if (audioTrack) {
-          setDeviceName(audioTrack.label || "Microphone mặc định (Default)");
+      setPermissionGranted(true);
+      await refreshDeviceList();
+    } catch (err: any) {
+      console.error(err);
+      handleError(err);
+    }
+  };
+
+  const refreshDeviceList = async () => {
+    try {
+      const allDevices = await navigator.mediaDevices.enumerateDevices();
+      const audioInputs = allDevices.filter(d => d.kind === 'audioinput');
+      setDevices(audioInputs);
+      
+      // Select default if not set
+      if (audioInputs.length > 0 && !selectedDeviceId) {
+         // Prefer 'default' or the first one
+         const defaultDev = audioInputs.find(d => d.deviceId === 'default');
+         const targetId = defaultDev ? defaultDev.deviceId : audioInputs[0].deviceId;
+         // Call startStream but handle error if it fails immediately
+         startStream(targetId).catch(err => {
+             console.error("Auto-start failed", err);
+             // Don't set global error here to avoid UI flash, let user try manually selecting
+         });
+      }
+    } catch (e) {
+      console.warn("Error enumerating devices", e);
+    }
+  };
+
+  // 2. Start Processing Audio Stream
+  const startStream = async (deviceId: string) => {
+    stopResources(); // Stop previous stream
+    setSelectedDeviceId(deviceId);
+    setError('');
+
+    try {
+      let stream: MediaStream;
+      
+      try {
+          // Attempt 1: Try with raw audio constraints (best for testing)
+          stream = await navigator.mediaDevices.getUserMedia({
+            audio: {
+              deviceId: { exact: deviceId },
+              echoCancellation: false,
+              autoGainControl: false,
+              noiseSuppression: false
+            }
+          });
+      } catch (constraintErr) {
+          console.warn("Raw audio constraints failed, trying default...", constraintErr);
+          // Attempt 2: Fallback to basic audio constraint with deviceId
+          // This handles cases where hardware/browser doesn't support disabling processing
+          stream = await navigator.mediaDevices.getUserMedia({
+            audio: {
+              deviceId: { exact: deviceId }
+            }
+          });
       }
 
-      // 2. Setup Audio Context & Analyser
-      const AudioCtx = window.AudioContext || (window as any).webkitAudioContext;
-      const ctx = new AudioCtx();
-      // Ensure context is running (fixes issues where it starts suspended)
-      if (ctx.state === 'suspended') {
-        await ctx.resume();
-      }
-      audioContextRef.current = ctx;
+      streamRef.current = stream;
 
+      // Init AudioContext safely
+      if (!audioContextRef.current) {
+        const AudioCtx = window.AudioContext || (window as any).webkitAudioContext;
+        audioContextRef.current = new AudioCtx();
+      }
+      
+      if (audioContextRef.current.state === 'suspended') {
+        await audioContextRef.current.resume();
+      }
+
+      const ctx = audioContextRef.current;
       const analyser = ctx.createAnalyser();
-      analyser.fftSize = 2048;
+      analyser.fftSize = 256;
+      analyser.smoothingTimeConstant = 0.5;
       analyserRef.current = analyser;
 
       const source = ctx.createMediaStreamSource(stream);
       source.connect(analyser);
       sourceRef.current = source;
 
-      // 3. Setup Recorder
-      // Try to find a supported mime type
-      const mimeTypes = [
-        'audio/webm;codecs=opus',
-        'audio/webm',
-        'audio/mp4',
-        'audio/ogg;codecs=opus',
-        '' // Default
-      ];
-      const supportedType = mimeTypes.find(type => type === '' || MediaRecorder.isTypeSupported(type));
-      
-      const recorder = new MediaRecorder(stream, supportedType ? { mimeType: supportedType } : undefined);
-      
-      recorder.ondataavailable = (e) => {
-        if (e.data.size > 0) chunksRef.current.push(e.data);
-      };
-
-      recorder.onstop = () => {
-        const blob = new Blob(chunksRef.current, { type: recorder.mimeType || 'audio/webm' });
-        chunksRef.current = [];
-        const url = URL.createObjectURL(blob);
-        setAudioBlobUrl(url);
-      };
-
-      mediaRecorderRef.current = recorder;
-
-      // 4. Start Visualizer
-      drawVisualizer();
-      setStatus('ACTIVE');
+      // Start Measuring Volume loop
+      measureVolume();
 
     } catch (err: any) {
-      console.error("Mic Error:", err);
-      let msg = "Không thể khởi động Microphone.";
+      handleError(err);
+    }
+  };
+
+  const handleError = (err: any) => {
+      let msg = "Không thể truy cập Microphone.";
       if (err.name === 'NotAllowedError' || err.name === 'PermissionDeniedError') {
-        msg = "Quyền truy cập Microphone bị từ chối. Vui lòng cho phép trong cài đặt trình duyệt (biểu tượng ổ khóa trên thanh địa chỉ).";
+          msg = "Quyền truy cập bị từ chối (Permission denied). Vui lòng kiểm tra biểu tượng ổ khóa 🔒 trên thanh địa chỉ và chọn 'Allow' hoặc 'Reset permission'.";
       } else if (err.name === 'NotFoundError') {
-        msg = "Không tìm thấy thiết bị Microphone.";
+          msg = "Không tìm thấy thiết bị Microphone.";
+      } else if (err.name === 'NotReadableError') {
+          msg = "Microphone đang bị ứng dụng khác chiếm dụng hoặc gặp lỗi phần cứng.";
+      } else if (err.name === 'OverconstrainedError') {
+          msg = "Thiết bị không hỗ trợ các cài đặt yêu cầu.";
       } else {
-        msg = err.message || msg;
+          msg = `Lỗi: ${err.message}`;
       }
-      setErrorMessage(msg);
-      setStatus('ERROR');
-      stopAll(); // Ensure clean state
-    }
+      setError(msg);
   };
 
-  const drawVisualizer = () => {
-    if (!canvasRef.current || !analyserRef.current) return;
-    const canvas = canvasRef.current;
-    const ctx = canvas.getContext('2d');
-    const analyser = analyserRef.current;
+  // 3. Measure Volume (RMS)
+  const measureVolume = () => {
+    if (!analyserRef.current) return;
     
-    if (!ctx) return;
+    const dataArray = new Uint8Array(analyserRef.current.frequencyBinCount);
+    analyserRef.current.getByteFrequencyData(dataArray);
 
-    const bufferLength = analyser.frequencyBinCount;
-    const dataArray = new Uint8Array(bufferLength);
+    let sum = 0;
+    for (let i = 0; i < dataArray.length; i++) {
+        sum += dataArray[i];
+    }
+    const average = sum / dataArray.length;
+    
+    // Normalize to 0-100 range
+    const vol = Math.min(100, Math.round((average / 100) * 100 * 1.5)); // 1.5x boost for visibility
 
-    const draw = () => {
-      rafRef.current = requestAnimationFrame(draw);
-      analyser.getByteFrequencyData(dataArray);
-
-      ctx.fillStyle = '#111827'; // BG Color
-      ctx.fillRect(0, 0, canvas.width, canvas.height);
-
-      const barWidth = (canvas.width / bufferLength) * 2.5;
-      let barHeight;
-      let x = 0;
-
-      for(let i = 0; i < bufferLength; i++) {
-        barHeight = dataArray[i];
-
-        // Dynamic Color
-        const r = barHeight + 25 * (i/bufferLength);
-        const g = 250 * (i/bufferLength);
-        const b = 50;
-
-        ctx.fillStyle = `rgb(${r},${g},${b})`;
-        // Scale height to fit
-        const h = (barHeight / 255) * canvas.height;
-        ctx.fillRect(x, canvas.height - h, barWidth, h);
-
-        x += barWidth + 1;
-      }
-    };
-    draw();
+    setVolume(vol);
+    rafRef.current = requestAnimationFrame(measureVolume);
   };
 
-  const handleToggleRecord = () => {
-    if (!mediaRecorderRef.current) return;
+  // 4. Handle "Listen to this device" toggle
+  const toggleListen = () => {
+    if (!sourceRef.current || !audioContextRef.current) return;
 
-    if (status === 'RECORDING') {
-      mediaRecorderRef.current.stop();
-      setStatus('ACTIVE');
+    if (isListening) {
+      sourceRef.current.disconnect();
+      if (analyserRef.current) sourceRef.current.connect(analyserRef.current);
+      setIsListening(false);
     } else {
-      chunksRef.current = [];
-      setAudioBlobUrl(null);
-      mediaRecorderRef.current.start();
-      setStatus('RECORDING');
+      sourceRef.current.connect(audioContextRef.current.destination);
+      setIsListening(true);
     }
+  };
+
+  const handleDeviceChange = (e: React.ChangeEvent<HTMLSelectElement>) => {
+    const newId = e.target.value;
+    if (isListening) toggleListen(); 
+    startStream(newId);
   };
 
   return (
-    <div className="flex flex-col items-center justify-center w-full h-full p-6">
-      <h2 className="text-2xl font-bold text-green-400 mb-2">Test Microphone</h2>
-      <p className="text-gray-400 text-sm mb-6 max-w-lg text-center">
-        Đảm bảo trình duyệt được cấp quyền truy cập Microphone. Nhấn nút bên dưới để bắt đầu.
-      </p>
+    <div className="flex flex-col items-center justify-start w-full h-full p-6 max-w-3xl mx-auto overflow-y-auto">
+      <h2 className="text-2xl font-bold text-green-400 mb-6">Test Microphone (Chế độ Windows)</h2>
 
-      {/* ERROR MESSAGE */}
-      {status === 'ERROR' && (
-        <div className="bg-red-900/50 border border-red-500 text-red-200 p-4 rounded-lg mb-6 max-w-lg flex items-start gap-3">
-          <svg xmlns="http://www.w3.org/2000/svg" className="h-6 w-6 flex-shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-             <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z" />
-          </svg>
-          <div>
-            <h3 className="font-bold">Lỗi khởi động Mic:</h3>
-            <p className="text-sm">{errorMessage}</p>
-          </div>
+      {/* ERROR */}
+      {error && (
+        <div className="w-full bg-red-900/50 border border-red-500 text-red-200 p-4 rounded-lg mb-6 flex items-start gap-3 animate-pulse">
+           <svg className="w-6 h-6 flex-shrink-0 mt-0.5" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 8v4m0 4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" /></svg>
+           <div>
+               <p className="font-bold">Đã xảy ra lỗi:</p>
+               <p>{error}</p>
+           </div>
         </div>
       )}
 
-      {/* DEVICE INFO - Shows ONLY when active */}
-      {status !== 'IDLE' && status !== 'ERROR' && deviceName && (
-          <div className="bg-gray-800 border border-gray-600 px-4 py-2 rounded-lg mb-4 flex items-center gap-2 animate-fade-in-up">
-              <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5 text-green-400" viewBox="0 0 20 20" fill="currentColor">
-                <path fillRule="evenodd" d="M7 4a3 3 0 016 0v4a3 3 0 11-6 0V4zm4 10.93A7.001 7.001 0 0017 8a1 1 0 10-2 0A5 5 0 015 8a1 1 0 00-2 0 7.001 7.001 0 006 6.93V17H6a1 1 0 100 2h8a1 1 0 100-2h-3v-2.07z" clipRule="evenodd" />
-              </svg>
-              <span className="text-gray-300 font-bold text-sm">Thiết bị: <span className="text-white">{deviceName}</span></span>
-          </div>
-      )}
-
-      {/* VISUALIZER */}
-      <div className="relative w-full max-w-3xl h-64 bg-gray-900 rounded-xl border border-gray-700 shadow-inner overflow-hidden mb-6 flex items-center justify-center">
-        {status === 'IDLE' || status === 'ERROR' ? (
-           <div className="text-gray-600 flex flex-col items-center">
-              <svg xmlns="http://www.w3.org/2000/svg" className="h-16 w-16 mb-2 opacity-30" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                 <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1} d="M19 11a7 7 0 01-7 7m0 0a7 7 0 01-7-7m7 7v4m0 0H8m4 0h4m-4-8a3 3 0 01-3-3V5a3 3 0 116 0v6a3 3 0 01-3 3z" />
-              </svg>
-              <span>Sẵn sàng test</span>
-           </div>
-        ) : (
-           <canvas ref={canvasRef} width={800} height={256} className="w-full h-full" />
-        )}
-
-        {status === 'REQUESTING' && (
-           <div className="absolute inset-0 bg-black/70 flex items-center justify-center text-white z-10">
-              <div className="flex items-center gap-3">
-                 <div className="w-5 h-5 border-2 border-green-500 border-t-transparent rounded-full animate-spin"></div>
-                 Đang yêu cầu quyền truy cập...
-              </div>
-           </div>
-        )}
-      </div>
-
-      {/* CONTROLS */}
-      <div className="flex flex-wrap justify-center gap-4">
-        {(status === 'IDLE' || status === 'ERROR') ? (
+      {/* STEP 1: PERMISSION */}
+      {!permissionGranted ? (
+        <div className="text-center bg-gray-900 p-8 rounded-xl border border-gray-700 shadow-lg">
+           <div className="text-6xl mb-4">🎙️</div>
+           <h3 className="text-xl font-bold text-white mb-2">Yêu cầu quyền truy cập</h3>
+           <p className="text-gray-400 mb-6 max-w-md mx-auto">
+             Để kiểm tra microphone, trình duyệt cần bạn cho phép quyền truy cập. 
+             <br/><span className="text-yellow-500 text-sm">Nếu bạn đã bấm "Allow" mà vẫn lỗi, hãy thử tải lại trang.</span>
+           </p>
            <button 
-             onClick={initMic}
-             className="px-8 py-3 bg-blue-600 hover:bg-blue-700 text-white font-bold rounded-lg shadow-lg transition-transform hover:scale-105 active:scale-95"
+             onClick={requestAccess}
+             className="px-6 py-3 bg-blue-600 hover:bg-blue-700 text-white font-bold rounded-lg shadow-lg transition-transform hover:scale-105"
            >
-             Cho phép & Bắt đầu Test
+             Cho phép Microphone
            </button>
-        ) : (
-           <>
-             {/* STOP BUTTON */}
-             <button 
-               onClick={stopAll}
-               className="px-6 py-3 bg-gray-700 hover:bg-gray-600 text-white font-bold rounded-lg border border-gray-600"
-             >
-               Tắt Microphone
-             </button>
-
-             {/* RECORD BUTTON */}
-             <button 
-               onClick={handleToggleRecord}
-               className={`px-6 py-3 rounded-lg font-bold flex items-center gap-2 transition-all ${
-                 status === 'RECORDING' 
-                   ? 'bg-red-600 hover:bg-red-700 text-white animate-pulse shadow-[0_0_15px_rgba(220,38,38,0.5)]' 
-                   : 'bg-green-600 hover:bg-green-700 text-white'
-               }`}
-             >
-               {status === 'RECORDING' ? (
-                 <>
-                   <div className="w-3 h-3 bg-white rounded-sm"></div>
-                   Dừng Ghi Âm
-                 </>
-               ) : (
-                 <>
-                   <div className="w-3 h-3 bg-red-100 rounded-full"></div>
-                   Ghi Âm Thử
-                 </>
-               )}
-             </button>
-           </>
-        )}
-      </div>
-
-      {/* PLAYBACK */}
-      {audioBlobUrl && (
-        <div className="mt-8 bg-gray-800 p-4 rounded-xl border border-gray-600 w-full max-w-md animate-[fadeIn_0.5s_ease-out]">
-           <h3 className="text-green-400 font-bold mb-2 text-sm uppercase tracking-wider">Kết quả Ghi âm</h3>
-           <audio controls src={audioBlobUrl} className="w-full mb-2" />
-           <div className="text-right">
-              <a href={audioBlobUrl} download="test-mic.webm" className="text-xs text-blue-400 hover:text-blue-300 hover:underline">
-                 Tải file ghi âm
-              </a>
-           </div>
         </div>
-      )}
-      
-      {/* GUIDE */}
-      {status === 'ACTIVE' && !audioBlobUrl && (
-        <p className="mt-4 text-xs text-gray-500 animate-pulse">
-           Microphone đang hoạt động. Hãy nói để kiểm tra sóng âm.
-        </p>
+      ) : (
+        /* STEP 2: MAIN INTERFACE */
+        <div className="w-full space-y-6">
+           
+           {/* DEVICE SELECTION */}
+           <div className="bg-gray-800 p-5 rounded-xl border border-gray-700 shadow-md">
+              <label className="block text-gray-400 text-sm font-bold mb-2 uppercase tracking-wide">
+                Chọn thiết bị đầu vào (Input Device)
+              </label>
+              <div className="relative">
+                <select 
+                  value={selectedDeviceId}
+                  onChange={handleDeviceChange}
+                  className="w-full bg-gray-900 border border-gray-600 text-white py-3 px-4 rounded-lg appearance-none focus:outline-none focus:border-blue-500"
+                >
+                  {devices.map(device => (
+                    <option key={device.deviceId} value={device.deviceId}>
+                      {device.label || `Microphone ${device.deviceId.slice(0,5)}...`}
+                    </option>
+                  ))}
+                  {devices.length === 0 && <option value="">Đang tìm thiết bị...</option>}
+                </select>
+                <div className="pointer-events-none absolute inset-y-0 right-0 flex items-center px-2 text-gray-400">
+                  <svg className="fill-current h-4 w-4" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20"><path d="M9.293 12.95l.707.707L15.657 8l-1.414-1.414L10 10.828 5.757 6.586 4.343 8z"/></svg>
+                </div>
+              </div>
+              <p className="text-xs text-gray-500 mt-2">
+                Không thấy mic? <button onClick={requestAccess} className="text-blue-400 hover:underline">Tải lại danh sách</button> hoặc kiểm tra kết nối vật lý.
+              </p>
+           </div>
+
+           {/* VOLUME METER (WINDOWS STYLE) */}
+           <div className="bg-gray-800 p-6 rounded-xl border border-gray-700 shadow-md">
+              <h3 className="text-white font-bold text-lg mb-4 flex items-center gap-2">
+                 Test Âm Lượng
+                 {volume > 0 && <span className="w-2 h-2 bg-green-500 rounded-full animate-pulse"></span>}
+              </h3>
+              
+              <div className="relative h-6 bg-gray-900 rounded-full overflow-hidden border border-gray-600">
+                 {/* Background Grid */}
+                 <div className="absolute inset-0 flex">
+                    {[...Array(10)].map((_, i) => (
+                       <div key={i} className="flex-1 border-r border-gray-800/50 h-full"></div>
+                    ))}
+                 </div>
+                 
+                 {/* The Bar */}
+                 <div 
+                   className="h-full transition-all duration-75 ease-out"
+                   style={{ 
+                     width: `${Math.min(100, volume)}%`,
+                     backgroundColor: volume > 80 ? '#ef4444' : volume > 50 ? '#eab308' : '#3b82f6'
+                   }}
+                 />
+              </div>
+              <div className="flex justify-between text-xs text-gray-500 mt-1 font-mono">
+                 <span>0%</span>
+                 <span>50%</span>
+                 <span>100%</span>
+              </div>
+
+              <p className="text-sm text-gray-300 mt-4">
+                 Hãy nói hoặc thổi vào mic. Nếu thanh màu xanh di chuyển, mic của bạn đang hoạt động.
+              </p>
+           </div>
+
+           {/* LISTEN TO DEVICE */}
+           <div className="bg-gray-800 p-5 rounded-xl border border-gray-700 shadow-md flex items-center justify-between">
+              <div>
+                 <h3 className="text-white font-bold text-lg">Nghe thiết bị này (Listen to this device)</h3>
+                 <p className="text-gray-400 text-sm mt-1 max-w-sm">
+                    Phát âm thanh thu được từ mic trực tiếp ra loa/tai nghe để kiểm tra chất lượng. 
+                    <span className="text-yellow-500 block mt-1">⚠️ Đeo tai nghe để tránh bị hú (feedback loop)!</span>
+                 </p>
+              </div>
+              
+              <button
+                onClick={toggleListen}
+                className={`relative inline-flex h-8 w-14 items-center rounded-full transition-colors focus:outline-none ${isListening ? 'bg-green-500' : 'bg-gray-600'}`}
+              >
+                <span
+                  className={`inline-block h-6 w-6 transform rounded-full bg-white transition-transform ${isListening ? 'translate-x-7' : 'translate-x-1'}`}
+                />
+              </button>
+           </div>
+
+        </div>
       )}
     </div>
   );

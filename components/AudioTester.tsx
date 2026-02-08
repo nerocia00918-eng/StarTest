@@ -21,7 +21,7 @@ export const AudioTester: React.FC = () => {
     },
     { 
         url: 'https://soundcloud.com/quocduy05/hai-phong-fly-2026-am-nhac-no-o-cai-chi', 
-        label: 'Hải Phòng Fly', 
+        label: 'Fly', 
         desc: 'Vinahouse / Nonstop - Test độ căng của Bass.',
         icon: '✈️'
     },
@@ -33,8 +33,8 @@ export const AudioTester: React.FC = () => {
     },
     { 
         url: 'https://soundcloud.com/hung-76726861/ai-chung-ti-nh-u-o-c-ma-i-inh', 
-        label: 'Ai Chung Tình (Remix)', 
-        desc: 'Test Bass Cực Căng',
+        label: 'Ai Chung Tình Được Mãi', 
+        desc: 'Test Vocal',
         icon: '💣'
     },
     { 

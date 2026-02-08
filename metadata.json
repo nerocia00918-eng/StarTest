@@ -1,0 +1,8 @@
+{
+  "name": "STARTEST",
+  "description": "Bộ công cụ toàn diện để kiểm tra bàn phím, chuột, màn hình, loa, microphone và webcam. Tích hợp AI chẩn đoán lỗi phần cứng.",
+  "requestFramePermissions": [
+    "microphone",
+    "camera"
+  ]
+}

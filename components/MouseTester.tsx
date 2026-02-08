@@ -65,6 +65,63 @@ export const MouseTester: React.FC = () => {
   const trackingTotalFrames = useRef(0);
   const trackingHitFrames = useRef(0);
 
+  // === GLOBAL MOUSE EVENT LISTENERS ===
+  useEffect(() => {
+    const handleWindowMouseDown = (e: MouseEvent) => {
+        // Prevent navigation for Back (3) and Forward (4) buttons
+        if (e.button === 3 || e.button === 4) {
+            e.preventDefault();
+        }
+
+        setStats(prev => ({
+            ...prev,
+            leftClick: e.button === 0 ? true : prev.leftClick,
+            middleClick: e.button === 1 ? true : prev.middleClick,
+            rightClick: e.button === 2 ? true : prev.rightClick,
+            backClick: e.button === 3 ? true : prev.backClick, // M4
+            forwardClick: e.button === 4 ? true : prev.forwardClick, // M5
+        }));
+    };
+
+    const handleWindowMouseUp = (e: MouseEvent) => {
+        // Prevent default on mouseup too for safety with navigation buttons
+        if (e.button === 3 || e.button === 4) {
+            e.preventDefault();
+        }
+    };
+
+    const handleWindowContextMenu = (e: MouseEvent) => {
+        e.preventDefault();
+        setStats(prev => ({ ...prev, rightClick: true }));
+    };
+
+    const handleWindowWheel = (e: WheelEvent) => {
+        setStats(prev => ({
+            ...prev,
+            scrollUp: e.deltaY < 0 ? true : prev.scrollUp,
+            scrollDown: e.deltaY > 0 ? true : prev.scrollDown,
+        }));
+    };
+
+    const handleWindowDblClick = () => {
+        setStats(prev => ({ ...prev, doubleClick: true }));
+    };
+
+    window.addEventListener('mousedown', handleWindowMouseDown);
+    window.addEventListener('mouseup', handleWindowMouseUp);
+    window.addEventListener('contextmenu', handleWindowContextMenu);
+    window.addEventListener('wheel', handleWindowWheel, { passive: false });
+    window.addEventListener('dblclick', handleWindowDblClick);
+
+    return () => {
+        window.removeEventListener('mousedown', handleWindowMouseDown);
+        window.removeEventListener('mouseup', handleWindowMouseUp);
+        window.removeEventListener('contextmenu', handleWindowContextMenu);
+        window.removeEventListener('wheel', handleWindowWheel);
+        window.removeEventListener('dblclick', handleWindowDblClick);
+    };
+  }, []);
+
   // === POLLING RATE LOGIC ===
   const updatePollingGraph = useCallback(() => {
      const canvas = hzCanvasRef.current;
@@ -371,18 +428,9 @@ export const MouseTester: React.FC = () => {
       setCurrentHz(0);
   };
 
-  const handleMouseDown = (e: React.MouseEvent) => {
-    if (e.button === 3 || e.button === 4) e.preventDefault();
-    setStats(prev => ({
-      ...prev,
-      leftClick: e.button === 0 ? true : prev.leftClick,
-      middleClick: e.button === 1 ? true : prev.middleClick,
-      rightClick: e.button === 2 ? true : prev.rightClick,
-      backClick: e.button === 3 ? true : prev.backClick,
-      forwardClick: e.button === 4 ? true : prev.forwardClick,
-    }));
-    
-    // Check tracking immediately on click
+  // Handle Mouse Down specific for GAME Logic only (Stats handled globally now)
+  const handleGameMouseDown = (e: React.MouseEvent) => {
+    // Check tracking immediately on click if playing game
     if (e.button === 0 && gameState === 'PLAYING' && gameType === 'TRACKING') {
          checkTracking(e);
     }
@@ -469,10 +517,9 @@ export const MouseTester: React.FC = () => {
                 ))}
              </div>
              <div 
-               onDoubleClick={() => setStats(p => ({...p, doubleClick: true}))}
-               className="mt-3 w-full py-2 bg-gray-800 border border-gray-700 border-dashed rounded text-center text-xs text-gray-500 cursor-pointer hover:bg-gray-750 select-none"
+               className="mt-3 w-full py-2 bg-gray-800 border border-gray-700 border-dashed rounded text-center text-xs text-gray-500 select-none"
              >
-                 Double click here to test
+                 Double click anywhere to test
              </div>
           </div>
 
@@ -614,7 +661,7 @@ export const MouseTester: React.FC = () => {
              className="relative flex-grow bg-[#0a0a0a] overflow-hidden cursor-crosshair"
              style={{ backgroundImage: 'radial-gradient(#1f2937 1px, transparent 1px)', backgroundSize: '20px 20px' }}
              onMouseMove={handleMouseMove}
-             onMouseDown={handleMouseDown}
+             onMouseDown={handleGameMouseDown}
              onMouseUp={handleMouseUp}
           >
               {/* MENU STATE */}

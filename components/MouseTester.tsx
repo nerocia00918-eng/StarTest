@@ -13,8 +13,9 @@ interface Target {
   size: number;
   spawnTime: number;
   lifeTime?: number; // For Reflex game
-  vx?: number; // For Tracking game
-  vy?: number;
+  vx: number; // For Tracking game (Velocity X)
+  vy: number; // For Tracking game (Velocity Y)
+  nextChangeTime?: number; // For Tracking evasion logic
 }
 
 export const MouseTester: React.FC = () => {
@@ -51,13 +52,18 @@ export const MouseTester: React.FC = () => {
   const [score, setScore] = useState(0);
   const [timeLeft, setTimeLeft] = useState(0);
   const [targets, setTargets] = useState<Target[]>([]);
+  const [accuracy, setAccuracy] = useState(100); // For Tracking
   
-  // Refs for Game Loop
+  // Refs for Game Loop & State Sync
+  const targetsRef = useRef<Target[]>([]); 
   const requestRef = useRef<number>();
   const gameAreaRef = useRef<HTMLDivElement>(null);
   const scoreRef = useRef(0);
-  const lastGameTimeRef = useRef(0);
-  const trackingScoreAccumulator = useRef(0);
+  
+  // Tracking specifics
+  const isTrackingRef = useRef(false); // Is user currently locked on?
+  const trackingTotalFrames = useRef(0);
+  const trackingHitFrames = useRef(0);
 
   // === POLLING RATE LOGIC ===
   const updatePollingGraph = useCallback(() => {
@@ -110,14 +116,21 @@ export const MouseTester: React.FC = () => {
       updatePollingGraph();
   }, [hzHistory, updatePollingGraph]);
 
-  // === GAME LOOP ===
+  // === GAME HELPER: SPAWN ===
   const spawnTarget = useCallback(() => {
       if (!gameAreaRef.current) return;
       const { clientWidth: w, clientHeight: h } = gameAreaRef.current;
       
       let size = 50;
-      if (difficulty === 'EASY') size = 70;
-      if (difficulty === 'HARD') size = 30;
+      let baseSpeed = 6;
+      if (difficulty === 'EASY') { size = 80; baseSpeed = 4; }
+      if (difficulty === 'HARD') { size = 40; baseSpeed = 10; }
+
+      // Ensure non-zero velocity for Tracking
+      let vx = (Math.random() - 0.5) * baseSpeed;
+      let vy = (Math.random() - 0.5) * baseSpeed;
+      if (Math.abs(vx) < 1) vx = baseSpeed / 2;
+      if (Math.abs(vy) < 1) vy = baseSpeed / 2;
 
       const newTarget: Target = {
           id: Date.now() + Math.random(),
@@ -125,132 +138,187 @@ export const MouseTester: React.FC = () => {
           y: Math.random() * (h - size),
           size: size,
           spawnTime: Date.now(),
-          lifeTime: difficulty === 'HARD' ? 800 : difficulty === 'NORMAL' ? 1200 : 2000, // For Reflex
-          vx: (Math.random() - 0.5) * (difficulty === 'HARD' ? 12 : 6), // For Tracking
-          vy: (Math.random() - 0.5) * (difficulty === 'HARD' ? 12 : 6)
+          lifeTime: difficulty === 'HARD' ? 800 : difficulty === 'NORMAL' ? 1200 : 2000, 
+          vx,
+          vy,
+          nextChangeTime: Date.now() + 500 + Math.random() * 1000
       };
 
       if (gameType === 'TRACKING') {
-          setTargets([newTarget]); // Only 1 target for tracking
+          // Replace all targets for tracking
+          targetsRef.current = [newTarget];
+          setTargets([newTarget]);
       } else {
+          // Add to existing for others
+          targetsRef.current = [...targetsRef.current, newTarget];
           setTargets(prev => [...prev, newTarget]);
       }
   }, [difficulty, gameType]);
 
-  const gameLoop = useCallback((time: number) => {
-      if (gameState !== 'PLAYING') return;
+  // === GAME LOOP ENGINE ===
+  useEffect(() => {
+      if (gameState !== 'PLAYING') {
+          if (requestRef.current) cancelAnimationFrame(requestRef.current);
+          return;
+      }
 
-      const dt = time - lastGameTimeRef.current;
-      lastGameTimeRef.current = time;
+      let lastTime = performance.now();
+      let timerAccumulator = 0;
 
-      // Timer Logic
-      if (Math.floor(time / 1000) > Math.floor((time - dt) / 1000)) {
-          setTimeLeft(prev => {
-              if (prev <= 1) {
-                  setGameState('FINISHED');
-                  return 0;
+      const loop = (time: number) => {
+          const dt = time - lastTime;
+          lastTime = time;
+
+          // 1. Timer Logic
+          timerAccumulator += dt;
+          if (timerAccumulator >= 1000) {
+              timerAccumulator -= 1000;
+              setTimeLeft(prev => {
+                  if (prev <= 1) {
+                      setGameState('FINISHED');
+                      return 0;
+                  }
+                  return prev - 1;
+              });
+          }
+
+          // 2. Game Logic
+          if (gameType === 'TRACKING') {
+              const now = Date.now();
+              const w = gameAreaRef.current?.clientWidth || 800;
+              const h = gameAreaRef.current?.clientHeight || 600;
+
+              const updatedTargets = targetsRef.current.map(t => {
+                  let nx = t.x + t.vx; // Movement per frame
+                  let ny = t.y + t.vy;
+                  let nvx = t.vx;
+                  let nvy = t.vy;
+                  let nextChange = t.nextChangeTime || 0;
+
+                  // Evasive maneuvers (Random direction change)
+                  if (now > nextChange) {
+                       const speedMult = difficulty === 'HARD' ? 12 : (difficulty === 'EASY' ? 5 : 8);
+                       nvx = (Math.random() - 0.5) * speedMult; 
+                       nvy = (Math.random() - 0.5) * speedMult;
+                       // Ensure it keeps moving
+                       if (Math.abs(nvx) < 1) nvx = 2;
+                       if (Math.abs(nvy) < 1) nvy = 2;
+                       nextChange = now + 400 + Math.random() * 800;
+                  }
+
+                  // Bounce off walls
+                  if (nx <= 0) { nx = 0; nvx = Math.abs(nvx); }
+                  if (nx >= w - t.size) { nx = w - t.size; nvx = -Math.abs(nvx); }
+                  
+                  if (ny <= 0) { ny = 0; nvy = Math.abs(nvy); }
+                  if (ny >= h - t.size) { ny = h - t.size; nvy = -Math.abs(nvy); }
+
+                  return { ...t, x: nx, y: ny, vx: nvx, vy: nvy, nextChangeTime: nextChange };
+              });
+              
+              // Sync Ref and State
+              targetsRef.current = updatedTargets;
+              setTargets(updatedTargets);
+
+              // Scoring & Stats
+              trackingTotalFrames.current++;
+              if (isTrackingRef.current) {
+                  trackingHitFrames.current++;
+                  setScore(s => s + 5);
               }
-              return prev - 1;
-          });
-      }
+              if (trackingTotalFrames.current % 10 === 0 && trackingTotalFrames.current > 0) {
+                  setAccuracy(Math.round((trackingHitFrames.current / trackingTotalFrames.current) * 100));
+              }
+          } 
+          else if (gameType === 'REFLEX') {
+              // Reflex logic...
+              const now = Date.now();
+              const validTargets = targetsRef.current.filter(t => (now - t.spawnTime) < (t.lifeTime || 1000));
+              
+              if (validTargets.length !== targetsRef.current.length) {
+                  targetsRef.current = validTargets;
+                  setTargets(validTargets);
+              }
+              // Chance to spawn new target if low count
+              if (targetsRef.current.length < 3 && Math.random() < 0.03) {
+                  spawnTarget();
+              }
+          }
 
-      // Game Specific Logic
-      if (gameType === 'REFLEX') {
-          setTargets(prev => prev.filter(t => {
-              const age = Date.now() - t.spawnTime;
-              return age < (t.lifeTime || 1000);
-          }));
-          
-          // Spawn new if empty (simple logic)
-          if (Math.random() < 0.05) spawnTarget(); 
-      } 
-      else if (gameType === 'TRACKING') {
-           setTargets(prev => prev.map(t => {
-               let nx = t.x + (t.vx || 0);
-               let ny = t.y + (t.vy || 0);
-               let nvx = t.vx || 0;
-               let nvy = t.vy || 0;
+          // Continue Loop
+          requestRef.current = requestAnimationFrame(loop);
+      };
 
-               // Bounce
-               if (!gameAreaRef.current) return t;
-               const maxX = gameAreaRef.current.clientWidth - t.size;
-               const maxY = gameAreaRef.current.clientHeight - t.size;
+      requestRef.current = requestAnimationFrame(loop);
 
-               if (nx <= 0 || nx >= maxX) nvx *= -1;
-               if (ny <= 0 || ny >= maxY) nvy *= -1;
+      return () => {
+          if (requestRef.current) cancelAnimationFrame(requestRef.current);
+      };
+  }, [gameState, gameType, difficulty, spawnTarget]); // Re-init loop if game parameters change
 
-               return { ...t, x: Math.max(0, Math.min(nx, maxX)), y: Math.max(0, Math.min(ny, maxY)), vx: nvx, vy: nvy };
-           }));
-
-           // Tracking Score Check is done in MouseMove for performance, or here if we track mouse pos globally
-      }
-
-      requestRef.current = requestAnimationFrame(gameLoop);
-  }, [gameState, gameType, spawnTarget]);
-
-  // Start Game
+  // === START GAME ===
   const startGame = () => {
       setScore(0);
       scoreRef.current = 0;
-      setTimeLeft(30); // 30 seconds
+      setTimeLeft(30); 
+      setAccuracy(100);
       setTargets([]);
-      setGameState('PLAYING');
-      lastGameTimeRef.current = performance.now();
+      targetsRef.current = [];
       
-      // Initial Spawn
+      trackingTotalFrames.current = 0;
+      trackingHitFrames.current = 0;
+      isTrackingRef.current = false;
+      
+      // Spawn initial target immediately so it exists when loop starts
       spawnTarget();
-      if (gameType === 'REFLEX') {
-          // Spawn a few more for reflex
-          setTimeout(spawnTarget, 200);
-      }
-
-      requestRef.current = requestAnimationFrame(gameLoop);
+      
+      // Setting state triggers the useEffect loop
+      setGameState('PLAYING');
   };
 
-  useEffect(() => {
-      if (gameState === 'FINISHED') {
-          if (requestRef.current) cancelAnimationFrame(requestRef.current);
-      }
-  }, [gameState]);
-
-  // Handle Target Clicks
+  // Handle Target Clicks (Precision/Reflex)
   const handleTargetClick = (tId: number, e: React.MouseEvent) => {
       e.stopPropagation();
-      if (gameType === 'TRACKING') return; // Tracking handles score differently
+      if (gameType === 'TRACKING') return; 
 
       setScore(s => s + 100);
-      setTargets(prev => prev.filter(t => t.id !== tId));
+      const newTargets = targetsRef.current.filter(t => t.id !== tId);
+      targetsRef.current = newTargets;
+      setTargets(newTargets);
       
-      if (gameType === 'PRECISION') {
-          spawnTarget(); // Immediate respawn
-      }
+      if (gameType === 'PRECISION') spawnTarget();
   };
 
-  // Handle Tracking Mouse Hold
+  // Handle Tracking Logic (Called from MouseMove)
   const checkTracking = (e: React.MouseEvent) => {
-      if (gameType !== 'TRACKING' || gameState !== 'PLAYING') return;
-      if (e.buttons !== 1) return; // Must hold left click
+      if (gameType !== 'TRACKING' || gameState !== 'PLAYING') {
+          isTrackingRef.current = false;
+          return;
+      }
+      
+      // Must hold Left Click to track
+      if (e.buttons !== 1) {
+          isTrackingRef.current = false;
+          return;
+      }
 
       const rect = gameAreaRef.current?.getBoundingClientRect();
-      if (!rect || targets.length === 0) return;
+      if (!rect || targetsRef.current.length === 0) {
+          isTrackingRef.current = false;
+          return;
+      }
 
       const mx = e.clientX - rect.left;
       const my = e.clientY - rect.top;
-      const t = targets[0];
+      const t = targetsRef.current[0];
       const radius = t.size / 2;
       const centerX = t.x + radius;
       const centerY = t.y + radius;
 
       const dist = Math.sqrt((mx - centerX) ** 2 + (my - centerY) ** 2);
       
-      if (dist < radius) {
-          // Using a ref accumulator to throttle state updates
-          trackingScoreAccumulator.current += 1;
-          if (trackingScoreAccumulator.current > 5) {
-               setScore(s => s + 10);
-               trackingScoreAccumulator.current = 0;
-          }
-      }
+      // Relaxed hit detection for better UX
+      isTrackingRef.current = dist < (radius * 1.2); 
   };
 
   // === GLOBAL EVENT HANDLERS ===
@@ -258,22 +326,18 @@ export const MouseTester: React.FC = () => {
     const now = performance.now();
     setStats(prev => ({ ...prev, x: e.nativeEvent.offsetX, y: e.nativeEvent.offsetY }));
 
-    // 1. POLLING RATE CALCULATION
+    // 1. POLLING RATE
     if (isMeasuringHz.current) {
         const dt = now - lastMouseMoveTime.current;
         if (dt > 0) {
             const instantHz = 1000 / dt;
             hzBuffer.current.push(instantHz);
-            
-            // Average every 10 samples to smooth graph
             if (hzBuffer.current.length >= 5) {
                 const sum = hzBuffer.current.reduce((a, b) => a + b, 0);
                 const avg = Math.round(sum / hzBuffer.current.length);
-                
                 setCurrentHz(avg);
                 if (avg > maxHz) setMaxHz(avg);
-                setAvgHz(prev => Math.round((prev + avg) / 2)); // Simple running average
-
+                setAvgHz(prev => Math.round((prev + avg) / 2));
                 setHzHistory(prev => {
                     const next = [...prev, avg];
                     if (next.length > 50) next.shift();
@@ -285,7 +349,7 @@ export const MouseTester: React.FC = () => {
         lastMouseMoveTime.current = now;
     }
 
-    // 2. DPI MEASURE
+    // 2. DPI
     if (dpiMode === 'MEASURING') {
         setAccumulatedPixels(prev => prev + Math.abs(e.movementX));
     }
@@ -295,7 +359,7 @@ export const MouseTester: React.FC = () => {
         checkTracking(e);
     }
 
-  }, [dpiMode, gameState, gameType, maxHz]); // Added deps but kept heavy logic inside
+  }, [dpiMode, gameState, gameType, maxHz]);
 
   const handleMouseEnterHz = () => {
       isMeasuringHz.current = true;
@@ -318,9 +382,16 @@ export const MouseTester: React.FC = () => {
       forwardClick: e.button === 4 ? true : prev.forwardClick,
     }));
     
-    if (e.button === 0 && dpiMode === 'IDLE' && gameState === 'MENU') {
-        // Maybe initiate drawing if we add that back
+    // Check tracking immediately on click
+    if (e.button === 0 && gameState === 'PLAYING' && gameType === 'TRACKING') {
+         checkTracking(e);
     }
+  };
+
+  // Stop tracking if mouse released
+  const handleMouseUp = () => {
+      isTrackingRef.current = false;
+      if (dpiMode === 'MEASURING') stopDpiMeasure();
   };
 
   const startDpiMeasure = (e: React.MouseEvent) => {
@@ -341,10 +412,6 @@ export const MouseTester: React.FC = () => {
     }
   };
 
-  // Listen for global mouse up to clear button states visually if needed
-  // But strictly, we keep them "ON" to show they work (as per original logic).
-  // Let's add a reset button for everything.
-
   const resetAll = () => {
       setStats({
           leftClick: false, rightClick: false, middleClick: false,
@@ -357,7 +424,11 @@ export const MouseTester: React.FC = () => {
       setAvgHz(0);
       setCurrentHz(0);
       setDpiResult(null);
+      
       setGameState('MENU');
+      setTargets([]);
+      targetsRef.current = [];
+      if (requestRef.current) cancelAnimationFrame(requestRef.current);
   };
 
   return (
@@ -527,6 +598,11 @@ export const MouseTester: React.FC = () => {
                   <div className="flex gap-4 font-mono font-bold text-white items-center">
                       <div className="bg-gray-900 px-3 py-1 rounded border border-gray-700 text-yellow-400">Score: {score}</div>
                       <div className={`bg-gray-900 px-3 py-1 rounded border border-gray-700 ${timeLeft < 5 ? 'text-red-500 animate-pulse' : 'text-green-400'}`}>Time: {timeLeft}s</div>
+                      {gameType === 'TRACKING' && (
+                          <div className={`px-3 py-1 rounded border border-gray-700 ${accuracy > 80 ? 'bg-green-900/50 text-green-400 border-green-700' : 'bg-gray-900 text-gray-400'}`}>
+                              Acc: {accuracy}%
+                          </div>
+                      )}
                       <button onClick={() => setGameState('FINISHED')} className="text-xs text-red-400 hover:text-red-300 underline">Stop</button>
                   </div>
               )}
@@ -539,6 +615,7 @@ export const MouseTester: React.FC = () => {
              style={{ backgroundImage: 'radial-gradient(#1f2937 1px, transparent 1px)', backgroundSize: '20px 20px' }}
              onMouseMove={handleMouseMove}
              onMouseDown={handleMouseDown}
+             onMouseUp={handleMouseUp}
           >
               {/* MENU STATE */}
               {gameState === 'MENU' && (
@@ -546,12 +623,12 @@ export const MouseTester: React.FC = () => {
                       <h2 className="text-4xl font-bold text-white mb-2 tracking-tighter">
                           {gameType === 'PRECISION' && 'CLICK PRECISION'}
                           {gameType === 'REFLEX' && 'SPEED REFLEX'}
-                          {gameType === 'TRACKING' && 'STREAM TRACKING'}
+                          {gameType === 'TRACKING' && 'EVASIVE TRACKING'}
                       </h2>
-                      <p className="text-gray-400 mb-8 max-w-md text-center">
+                      <p className="text-gray-400 mb-8 max-w-md text-center px-4">
                           {gameType === 'PRECISION' && 'Mục tiêu xuất hiện lần lượt. Hãy click chính xác và nhanh nhất có thể. Không giới hạn thời gian tồn tại của mục tiêu.'}
                           {gameType === 'REFLEX' && 'Mục tiêu sẽ biến mất sau thời gian ngắn! Hãy click trước khi chúng tan biến. Tốc độ là chìa khóa.'}
-                          {gameType === 'TRACKING' && 'Giữ chuột trái đè lên mục tiêu đang di chuyển để ghi điểm. Kiểm tra khả năng bám đuổi (Tracking) của bạn.'}
+                          {gameType === 'TRACKING' && 'Mục tiêu sẽ di chuyển và đổi hướng ngẫu nhiên. Giữ Chuột Trái (Hold Click) trên mục tiêu để ghi điểm và duy trì Accuracy.'}
                       </p>
                       <button 
                         onClick={startGame}
@@ -563,32 +640,57 @@ export const MouseTester: React.FC = () => {
               )}
 
               {/* PLAYING STATE: TARGETS */}
-              {gameState === 'PLAYING' && targets.map(t => (
-                  <div
-                      key={t.id}
-                      onMouseDown={(e) => handleTargetClick(t.id, e)}
-                      className="absolute rounded-full select-none"
-                      style={{
-                          left: t.x, top: t.y, width: t.size, height: t.size,
-                          background: gameType === 'TRACKING' ? 'radial-gradient(circle, #3b82f6 0%, #1d4ed8 100%)' : 'radial-gradient(circle, #ef4444 0%, #991b1b 100%)',
-                          boxShadow: gameType === 'TRACKING' ? '0 0 15px #3b82f6' : '0 0 10px #ef4444',
-                          cursor: 'pointer',
-                          transition: gameType === 'TRACKING' ? 'none' : 'transform 0.1s'
-                      }}
-                  >
-                      <div className="absolute inset-0 rounded-full border-2 border-white/30"></div>
-                      {gameType === 'PRECISION' && (
-                          <div className="absolute top-1/2 left-1/2 w-2 h-2 bg-white rounded-full transform -translate-x-1/2 -translate-y-1/2"></div>
-                      )}
-                  </div>
-              ))}
+              {gameState === 'PLAYING' && targets.map(t => {
+                  const isLocked = gameType === 'TRACKING' && isTrackingRef.current;
+                  return (
+                      <div
+                          key={t.id}
+                          onMouseDown={(e) => handleTargetClick(t.id, e)}
+                          className="absolute rounded-full select-none flex items-center justify-center transition-transform"
+                          style={{
+                              left: t.x, top: t.y, width: t.size, height: t.size,
+                              // Visual style switch based on game type
+                              background: gameType === 'TRACKING' 
+                                ? (isLocked ? 'radial-gradient(circle, #22d3ee 0%, #0891b2 100%)' : 'radial-gradient(circle, #ef4444 0%, #991b1b 100%)')
+                                : 'radial-gradient(circle, #ef4444 0%, #991b1b 100%)',
+                              boxShadow: gameType === 'TRACKING' && isLocked 
+                                ? '0 0 25px #22d3ee, inset 0 0 10px white' 
+                                : '0 0 10px rgba(0,0,0,0.5)',
+                              cursor: 'pointer',
+                          }}
+                      >
+                          {/* Inner Design */}
+                          <div className={`absolute inset-0 rounded-full border-2 ${gameType === 'TRACKING' && isLocked ? 'border-white animate-ping opacity-50' : 'border-white/30'}`}></div>
+                          
+                          {gameType === 'PRECISION' && (
+                              <div className="w-2 h-2 bg-white rounded-full"></div>
+                          )}
+                          
+                          {/* Tracking Crosshair Effect */}
+                          {gameType === 'TRACKING' && (
+                              <div className={`w-full h-full rounded-full border border-white/40 flex items-center justify-center ${isLocked ? 'scale-110' : 'scale-90 opacity-50'}`}>
+                                   <div className="w-1 h-1 bg-white/80 rounded-full"></div>
+                              </div>
+                          )}
+                      </div>
+                  );
+              })}
 
               {/* FINISHED STATE */}
               {gameState === 'FINISHED' && (
                   <div className="absolute inset-0 flex flex-col items-center justify-center bg-black/80 backdrop-blur-md z-30 animate-[fadeIn_0.3s_ease-out]">
                       <div className="text-gray-400 text-sm uppercase tracking-widest mb-1">{gameType} • {difficulty}</div>
                       <div className="text-6xl font-black text-white mb-2">{score}</div>
-                      <div className="text-2xl text-yellow-400 font-bold mb-8">POINTS</div>
+                      <div className="text-2xl text-yellow-400 font-bold mb-4">POINTS</div>
+                      
+                      {gameType === 'TRACKING' && (
+                           <div className="mb-8 text-center">
+                               <div className="text-sm text-gray-400 uppercase">Tracking Accuracy</div>
+                               <div className={`text-3xl font-mono font-bold ${accuracy >= 80 ? 'text-green-400' : accuracy >= 50 ? 'text-yellow-400' : 'text-red-400'}`}>
+                                   {accuracy}%
+                               </div>
+                           </div>
+                      )}
 
                       <div className="flex gap-4">
                           <button onClick={startGame} className="px-8 py-3 bg-green-600 hover:bg-green-700 text-white font-bold rounded-lg transition-colors">
